@@ -62,6 +62,10 @@ def get_delivery_stream_tags(stream_name, exclusive_start_tag_key=None, limit=50
     return response
 
 
+# put_record and put_records have different response syntaxes and the put_records action contains a
+# list of the individual record responses. this method should return the proper record response and
+# the put_records method should utilize this method to construct its response with the correct
+# syntax.
 def put_record(stream_name, record):
     return put_records(stream_name, [record])
 
@@ -70,6 +74,9 @@ def put_records(stream_name, records):
     stream = get_stream(stream_name)
     if not stream:
         return error_not_found(stream_name)
+    # this should be done as an (optional) transformation then sending, with the sending method
+    # based on the dest description instead of looping through each possible description type
+    # otherwise we'll need to repeat all of the transformation code needlessly
     for dest in stream.get("Destinations", []):
         if "ESDestinationDescription" in dest:
             es_dest = dest["ESDestinationDescription"]
@@ -99,10 +106,45 @@ def put_records(stream_name, records):
             s3_dest = dest["S3DestinationDescription"]
             bucket = bucket_name(s3_dest["BucketARN"])
             prefix = s3_dest.get("Prefix", "")
-
+            error_prefix = s3_dest.get("ErrorOutputPrefix")
             s3 = connect_to_resource("s3")
-            batched_data = b"".join([base64.b64decode(r.get("Data") or r["data"]) for r in records])
 
+            # invoke normalization lambda
+            if s3_dest["ProcessingConfiguration"]['Enabled']:
+                awslambda = connect_to_resource("lambda")
+                lambda_name = s3_dest["ProcessingConfiguration"]["Processors"][0]["ParameterValue"]
+                response = awslambda.invoke(FunctionName=lambda_name,
+                                            InvocationType="RequestResponse",
+                                            Payload=json.dumps(records))
+
+                # handle transformed data
+                if 200 <= response["StatusCode"] < 300:
+                    response_records = json.loads(response['Paylod'].read())
+                else:
+                    # mimic the firehose lambda retry logic
+                    LOG.error("Lambda %s invocation failed with error %s: %s" % (
+                        lambda_name,
+                        response["StatusCode"],
+                        response.get("FunctionError")
+                    ))
+                    raise Exception
+                trans_records = []
+                error_records = []
+                for record in response_records:
+                    if record['result'] == 'Ok' or record['result'] == 'Dropped':
+                        trans_records.append(record)
+                    else:
+                        error_records.append(record)
+                batched_data = b"".join([base64.b64decode(r.get("Data") or r["data"]) for r in error_records])
+                obj_path = get_s3_object_path(stream_name, error_prefix)
+                try:
+                    s3.Object(bucket, obj_path).put(Body=batched_data)
+                except Exception as e:
+                    LOG.error("Unable to put record to stream: %s %s" % (e, traceback.format_exc()))
+                    raise e
+                records = trans_records
+
+            batched_data = b"".join([base64.b64decode(r.get("Data") or r["data"]) for r in records])
             obj_path = get_s3_object_path(stream_name, prefix)
             try:
                 s3.Object(bucket, obj_path).put(Body=batched_data)
